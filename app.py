@@ -1,71 +1,91 @@
-from flask import Flask, render_template, request, jsonify
 import os
-from predict import predict_emotion
-from dataset_training import train_model_with_callback, EmotionCNN
 import base64
 import cv2
-import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from dataset import load_preprocessed_fer2013, create_data_loaders
+from flask import Flask, render_template, request, jsonify
+from dataset_training import EmotionCNN, train_model
+from predict import predict_emotion
 
 app = Flask(__name__)
-
-# Ensure the upload folder exists
-UPLOAD_FOLDER = 'static/uploads'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs('static/uploads', exist_ok=True)
 
 @app.route('/')
 def home():
     return render_template('index.html')
 
+@app.route('/train', methods=['POST'])
+def train():
+    try:
+        # Clear CUDA cache before starting
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        print("Loading dataset...")
+        train_dataset, val_dataset, test_dataset, _ = load_preprocessed_fer2013()
+        
+        # Use optimal batch size for CNN training
+        train_loader, val_loader, _ = create_data_loaders(
+            train_dataset, val_dataset, test_dataset, batch_size=64
+        )
+        
+        print("Initializing model...")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = EmotionCNN().to(device)
+        criterion = nn.CrossEntropyLoss()
+        
+        # Updated learning rate to optimal value
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+        
+        print("Starting training...")
+        history = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            num_epochs=20
+        )
+        
+        return jsonify({
+            'success': True,
+            'message': 'Training completed successfully',
+            'training_history': {
+                'train_losses': [float(loss) for loss in history['train_losses']],
+                'val_losses': [float(loss) for loss in history['val_losses']],
+                'train_accuracies': [float(acc) for acc in history['train_accuracies']],
+                'val_accuracies': [float(acc) for acc in history['val_accuracies']]
+            }
+        })
+    except Exception as e:
+        import traceback
+        print("Training error:", str(e))
+        print(traceback.format_exc())
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/predict', methods=['POST'])
 def predict():
-    if 'image' not in request.files:
+    if not request.files.get('image'):
         return jsonify({'error': 'No image uploaded'}), 400
     
-    file = request.files['image']
-    if file.filename == '':
-        return jsonify({'error': 'No image selected'}), 400
-    
     try:
-        # Read image file
-        image_bytes = file.read()
-        
-        # Get prediction
+        image_bytes = request.files['image'].read()
         result = predict_emotion(image_bytes)
         
         if result['success']:
-            # Convert face image to base64 for display
             _, buffer = cv2.imencode('.jpg', result['face_image'])
-            face_image_b64 = base64.b64encode(buffer).decode('utf-8')
-            
             return jsonify({
                 'success': True,
                 'emotion': result['emotion'],
                 'confidence': float(result['probability'] * 100),
                 'probabilities': result['probabilities'],
-                'face_image': face_image_b64
+                'face_image': base64.b64encode(buffer).decode('utf-8')
             })
-        else:
-            return jsonify({'error': 'No face detected in the image'}), 400
-            
+        return jsonify({'error': 'No face detected in the image'}), 400
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
-@app.route('/train', methods=['POST'])
-def train():
-    try:
-        # Start training using preprocessed dataset
-        history = train_model_with_callback()
-        
-        return jsonify({
-            'success': True,
-            'message': 'Training completed successfully'
-        })
-        
-    except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        }), 500
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8000, debug=True)
