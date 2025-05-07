@@ -4,9 +4,10 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import json
 from dataset import load_preprocessed_fer2013, create_data_loaders
 from flask import Flask, render_template, request, jsonify
-from dataset_training import EmotionCNN, train_model
+from dataset_training import EmotionCNN, train_model, METRICS_PATH
 from predict import predict_emotion
 
 app = Flask(__name__)
@@ -15,6 +16,18 @@ os.makedirs('static/uploads', exist_ok=True)
 @app.route('/')
 def home():
     return render_template('index.html')
+
+@app.route('/get_metrics', methods=['GET'])
+def get_metrics():
+    try:
+        if os.path.exists(METRICS_PATH):
+            with open(METRICS_PATH, 'r') as f:
+                metrics = json.load(f)
+            return jsonify({'success': True, 'metrics': metrics})
+        else:
+            return jsonify({'success': False, 'error': 'No metrics available. Train the model first.'}), 404
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/train', methods=['POST'])
 def train():
@@ -27,7 +40,7 @@ def train():
         train_dataset, val_dataset, test_dataset, _ = load_preprocessed_fer2013()
         
         # Use optimal batch size for CNN training
-        train_loader, val_loader, _ = create_data_loaders(
+        train_loader, val_loader, test_loader = create_data_loaders(
             train_dataset, val_dataset, test_dataset, batch_size=64
         )
         
@@ -44,9 +57,10 @@ def train():
             model=model,
             train_loader=train_loader,
             val_loader=val_loader,
+            test_loader=test_loader,  # Add test_loader for metrics calculation
             criterion=criterion,
             optimizer=optimizer,
-            num_epochs=20
+            num_epochs=25
         )
         
         return jsonify({
@@ -69,6 +83,11 @@ def train():
 def predict():
     if not request.files.get('image'):
         return jsonify({'error': 'No image uploaded'}), 400
+    
+    # Check if model exists
+    model_path = os.path.join('model', 'emotion_model.pth')
+    if not os.path.exists(model_path):
+        return jsonify({'success': False, 'error': 'Please train the model first before uploading an image'}), 400
     
     try:
         image_bytes = request.files['image'].read()

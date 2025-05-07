@@ -2,6 +2,9 @@ import os
 import torch
 import torch.nn as nn
 from torch.amp import GradScaler, autocast
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+import numpy as np
+import json
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -12,6 +15,7 @@ if device.type == 'cuda':
     torch.backends.cudnn.deterministic = False
 
 MODEL_PATH = os.path.join('model', 'emotion_model.pth')
+METRICS_PATH = os.path.join('model', 'metrics.json')
 os.makedirs('model', exist_ok=True)
 
 class EmotionCNN(nn.Module):
@@ -71,7 +75,68 @@ class EmotionCNN(nn.Module):
         
         return x
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=20):
+def calculate_metrics(model, test_loader):
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad(), autocast(device_type=device.type, enabled=device.type=='cuda'):
+        for images, labels in test_loader:
+            images = images.to(device, non_blocking=True)
+            outputs = model(images)
+            _, predicted = torch.max(outputs.data, 1)
+            all_preds.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.numpy())
+    
+    all_preds = np.array(all_preds)
+    all_labels = np.array(all_labels)
+    
+    # Calculate overall metrics
+    accuracy = accuracy_score(all_labels, all_preds)
+    precision, recall, f1_score, _ = precision_recall_fscore_support(all_labels, all_preds, average='weighted')
+    
+    # Calculate per-emotion metrics
+    per_emotion_metrics = {}
+    emotion_labels = {
+        0: 'Angry', 1: 'Disgust', 2: 'Fear', 3: 'Happy',
+        4: 'Sad', 5: 'Surprise', 6: 'Neutral'
+    }
+    
+    for emotion_idx in range(7):
+        mask = all_labels == emotion_idx
+        if np.any(mask):
+            emotion_preds = all_preds[mask]
+            emotion_labels_masked = all_labels[mask]
+            emotion_accuracy = accuracy_score(emotion_labels_masked, emotion_preds)
+            # Changed average parameter from 'binary' to 'weighted' for multiclass
+            emotion_precision, emotion_recall, emotion_f1, _ = precision_recall_fscore_support(
+                emotion_labels_masked, emotion_preds, average='weighted'
+            )
+            
+            per_emotion_metrics[emotion_labels[emotion_idx]] = {
+                'accuracy': float(emotion_accuracy),
+                'precision': float(emotion_precision),
+                'recall': float(emotion_recall),
+                'f1_score': float(emotion_f1)
+            }
+    
+    metrics = {
+        'overall': {
+            'accuracy': float(accuracy),
+            'precision': float(precision),
+            'recall': float(recall),
+            'f1_score': float(f1_score)
+        },
+        'per_emotion': per_emotion_metrics
+    }
+    
+    # Save metrics to file
+    with open(METRICS_PATH, 'w') as f:
+        json.dump(metrics, f, indent=4)
+    
+    return metrics
+
+def train_model(model, train_loader, val_loader, test_loader=None, criterion=None, optimizer=None, num_epochs=20):
     model.to(device)
     best_val_accuracy = 0.0
     history = {
@@ -165,4 +230,11 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             torch.cuda.empty_cache()
     
     print("\nTraining completed!")
+    
+    # Calculate and save metrics if test_loader is provided
+    if test_loader is not None:
+        print("\nCalculating model metrics...")
+        metrics = calculate_metrics(model, test_loader)
+        print("\nMetrics calculation completed and saved!")
+    
     return history
